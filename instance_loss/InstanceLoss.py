@@ -1,19 +1,20 @@
 import torch
-import nibabel as nib
 import numpy as np
-from .tools import connected_components, get_corrected_indices
+from instance_loss.tools import connected_components, get_corrected_indices
+from instance_loss.tools import get_bbox_indices, distance_box_iou_3D, distance_box_iou_2D
 from monai.losses import DiceLoss
 
-class InstanceCenterLoss(torch.nn.modules.loss._Loss):
+class InstanceLoss(torch.nn.modules.loss._Loss):
     """
-    Compute instance loss functions for both segmentation and detecion loss between two tensors without the
-    proximity loss. This instance loss functions calculate 3 different losses:
+    Compute instance loss functions for both segmentation and detecion loss between two tensors.
+    The data `outputs` (BNHW[D] where N is number of classes) is compared with ground truth `labels` (BNHW[D]).
+    The instance loss functions calculate 4 different losses:
         1. Instance segmentation loss
             1.a Instance segmentation loss for ground truth (`labels`) instances
             1.b Instance segmentation loss for predicted segmentation (`outputs`) instances
         2. Instance center loss
         3. False instance rate loss
-    The data `outputs` (BNHW[D] where N is number of classes) is compared with ground truth `labels` (BNHW[D]).
+        4. Instance proximity loss 
 
     For a two-class segmentation problem (i.e. background and foreground classes), either sigmoid or softmax
     non-linear function can be called within the function loss (set "activation = 'sigmoid'" or "activation = 'softmax'",
@@ -44,11 +45,11 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
         reduce_segmentation = "mean",
         instance_wise_reduce = "instance", # or data
         num_iterations = 350, 
-        segmentation_threshold = 0.5,
         max_cc_out = 50,
-        mul_too_many = 50,
         min_instance_size = 0,
+        segmentation_threshold = 0.5,
         centroid_offset = 5,
+        mul_too_many = 50,
         smoother = 1e-07,
         instance_wise_loss_no_tp = True,
         rate_instead_number = False,
@@ -242,7 +243,7 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
         """
         Args:
             outputs: The predicted segmentation. The shape should be BNH[WD], where N is the number of classes.
-            labels: The manual label/mask. The shape should be BNH[WD] or B1H[WD], where N is the number of classes.
+            labels : The manual label/mask. The shape should be BNH[WD] or B1H[WD], where N is the number of classes.
             cc_label_batch: The pre-computed CCA of the `labels`. If `cc_label_batch = None` the loss function
                 will perform CCA to the `labels` tensor.
 
@@ -252,17 +253,18 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
         Outputs:
             1. Pixel-wise segmentation loss
             2. Instance segmentation loss for `labels` instances
-            3. Instance segmentation loss for `labels` instances
+            3. Instance segmentation loss for `outputs` instances
             4. Instance center loss
             5. False instance rate loss for false instances
             6. False instance rate loss for missed instances
+            7. Instance proximity loss
 
         Raises:
             ValueError: When ``self.reduction`` is not one of ["mean", "sum", "none"].
 
         Example:
             >>> import torch
-            >>> from losses.InstanceCenterLoss import InstanceCenterLoss
+            >>> from losses.InstanceLoss import InstanceLoss
             >>> from monai.losses import DiceLoss
             >>> from monai.data.synthetic import create_test_image_3d
             >>> loss_dice = DiceLoss(
@@ -274,20 +276,20 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
             >>> _, out = create_test_image_3d(128, 128, 128, num_seg_classes=1)
             >>> lbl = torch.reshape(torch.tensor(lbl).float(), (1, 1, 128, 128, 128))
             >>> out = torch.reshape(torch.tensor(out).float(), (1, 1, 128, 128, 128))
-            >>> instance_center_loss = InstanceCenterLoss(
+            >>> instance_loss = dICILoss(
             >>>         loss_function_pixel=loss_dice,
             >>>         loss_function_instance=loss_dice,
             >>>         loss_function_center=loss_dice,
             >>>         num_out_chn = 1,
             >>>         activation="none",
             >>>     )
-            >>> instance_center_loss.print_parameters()
-            >>> seg_pixel, seg_instance, seg_center, fdr, cc_falsed, cc_missed = instance_center_loss(
+            >>> instance_loss.print_parameters()
+            >>> seg_pixel, seg_instance, seg_out, seg_center, proximity, fdr, false_rate, false_missed = instance_loss(
             >>>         out,
             >>>         lbl
             >>>     )
         """ 
-
+       
         # Dice loss function to calculate the rate of missed and false instances
         loss_dice_per_output_instance = DiceLoss(
             to_onehot_y=False, 
@@ -318,15 +320,6 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
             
         elif self.activation != "softmax" and self.num_out_chn == 1 and self.object_chn == 1:
             segmentation_loss = self.loss_function_pixel(outputs, labels)
-
-        # print("outputs.shape    : ", outputs.shape)
-        # print("outputs_act.shape: ", outputs_act.shape)
-        # print("labels.shape     : ", labels.shape)
-        # print("outputs MAX      : ", torch.max(outputs))
-        # print("outputs_act MAX  : ", torch.max(outputs_act))
-        # print("labels MAX       : ", torch.max(labels))
-        # print("segmentation_loss: ", segmentation_loss)
-        # print(asda)
 
         batch_length = labels.shape[0]
 
@@ -522,7 +515,7 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
                     loss_per_instance_output = self.loss_function_instance(
                         output_batch * lbl_idx, 
                         label_batch * torch.isin(cc_label, intersect_ids))
-                    # print("loss_per_instance_output: ", loss_per_instance_output)
+                    # print(cc_out_counter, " -> loss_per_instance_output (DEBUGGING): ", loss_per_instance_output)
 
                     ## ADD SEGMENTATION TO THE LIST FOR ALL INSTANCES
                     if instance_wise_out_loss_flag:
@@ -540,16 +533,42 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
                     # nib.save(nim, 'blobs/out_' + str(cc_out_counter) + '.nii.gz')
                     # print(asda)
 
+                    ## GET BOUNDING BOX INFORMATION FOR DETECTION
+                    mins_out, maxs_out = get_bbox_indices(
+                        idx_min, 
+                        idx_max, 
+                        output_batch.shape,
+                        spatial_dims=self.spatial_dims
+                    )
+
+                    # Get bounding box information for detection (differentiable) -- OLD
+                    mins_out = torch.as_tensor(mins_out, device=output_batch.device) # * torch.max(output_batch * lbl_idx)
+                    maxs_out = torch.as_tensor(maxs_out, device=output_batch.device) # * torch.max(output_batch * lbl_idx)
+                    center_out = (mins_out + torch.ceil((maxs_out - mins_out) / 2)) # * torch.max(output_batch * lbl_idx)
+
+                    # # Get bounding box information for detection (differentiable)
+                    # mins_out = torch.as_tensor(mins_out, device=output_batch.device) * (loss_per_instance_output + self.smoother)
+                    # maxs_out = torch.as_tensor(maxs_out, device=output_batch.device) * (loss_per_instance_output + self.smoother)
+                    # center_out = (mins_out + torch.ceil((maxs_out - mins_out) / 2)) * (loss_per_instance_output + self.smoother)
+
                     ## ADD BOUNDING BOX INFORMATION FROM OUTPUT INSTANCES
                     if bounding_boxes_output:
                         detection_map_all = torch.cat((detection_map_all, torch.unsqueeze(detection_map, 0)), 0)
                         output_intersection = torch.cat((output_intersection, torch.unsqueeze(cc_label_location, 0)), 0)
                         loss_per_output_instance = torch.cat((loss_per_output_instance, torch.unsqueeze(cc_label_loss, 0)), 0)
+                        
+                        center_coordinates_output = torch.cat((center_coordinates_output, torch.unsqueeze(center_out, 0)), 0)
+                        mins_boxes_coordinates_output = torch.cat((mins_boxes_coordinates_output, torch.unsqueeze(mins_out, 0)), 0)
+                        maxs_boxes_coordinates_output = torch.cat((maxs_boxes_coordinates_output, torch.unsqueeze(maxs_out, 0)), 0)
                     else:
                         bounding_boxes_output = True
                         detection_map_all = torch.unsqueeze(detection_map, 0)
                         output_intersection = torch.unsqueeze(cc_label_location, 0)
                         loss_per_output_instance = torch.unsqueeze(cc_label_loss, 0)
+
+                        center_coordinates_output = torch.unsqueeze(center_out, 0)
+                        mins_boxes_coordinates_output = torch.unsqueeze(mins_out, 0)
+                        maxs_boxes_coordinates_output = torch.unsqueeze(maxs_out, 0)
 
                 del cc_out
             else:
@@ -568,13 +587,45 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
                 loss_per_output_instance = torch.ones(
                     (temp, num_cc_label_temp), device=output_batch.device, dtype=output_batch.dtype, requires_grad=True)
 
+                ## Create mask with 1 in the middle of the batch (for backpropagation)
+                mask = torch.zeros(output_batch.shape, dtype=torch.bool, device=output_batch.device)
+                mask_center = torch.floor(torch.tensor(mask.shape) / 2).int()
+                if self.spatial_dims == 3:
+                    mask[0, 0, mask_center[2], mask_center[3], mask_center[4]] = True
+                elif self.spatial_dims == 2:
+                    mask[0, 0, mask_center[2], mask_center[3]] = True
+
+                ## COORDINATES FOR DETECTIONS -- (OLD V0)
+                position = torch.floor(torch.tensor(output_batch.squeeze().shape, device=output_batch.device) / 2)
+                mins_boxes_coordinates_output = (torch.zeros((temp, self.spatial_dims), dtype=output_batch.dtype, device=output_batch.device) + (position - 1))
+                center_coordinates_output = (torch.zeros((temp, self.spatial_dims), dtype=output_batch.dtype, device=output_batch.device) + position)
+                maxs_boxes_coordinates_output = (torch.zeros((temp, self.spatial_dims), dtype=output_batch.dtype, device=output_batch.device) + (position + 1))
+
+                # ## COORDINATES FOR DETECTIONS -- (OLD)
+                # position = torch.floor(torch.tensor(output_batch.squeeze().shape, device=output_batch.device) / 2)
+                # mins_boxes_coordinates_output = torch.max(output_batch + mask) * (torch.zeros(
+                #     (temp, self.spatial_dims), dtype=output_batch.dtype, device=output_batch.device) + (position - 1))
+                # center_coordinates_output = torch.max(output_batch + mask) * (torch.zeros(
+                #     (temp, self.spatial_dims), dtype=output_batch.dtype, device=output_batch.device) + position)
+                # maxs_boxes_coordinates_output = torch.max(output_batch + mask) * (torch.zeros(
+                #     (temp, self.spatial_dims), dtype=output_batch.dtype, device=output_batch.device) + (position + 1))
+
+                # ## COORDINATES FOR DETECTIONS
+                # position = torch.floor(torch.tensor(output_batch.squeeze().shape, device=output_batch.device) / 2)
+                # mins_boxes_coordinates_output = (loss_batch + self.smoother) * (torch.zeros(
+                #     (temp, self.spatial_dims), dtype=output_batch.dtype, device=output_batch.device) + (position - 1))
+                # center_coordinates_output = (loss_batch + self.smoother) * (torch.zeros(
+                #     (temp, self.spatial_dims), dtype=output_batch.dtype, device=output_batch.device) + position)
+                # maxs_boxes_coordinates_output = (loss_batch + self.smoother) * (torch.zeros(
+                #     (temp, self.spatial_dims), dtype=output_batch.dtype, device=output_batch.device) + (position + 1))
+
             ## Find which instances in label image correctly detecting output instances
             detected_instances = torch.max(detection_map_all, dim=0)
             
             ## FOR DEBUGGING
             # print("")
-            # print("detected_instances: ", detected_instances)
-            # print("detection_map_all: \n", detection_map_all)
+            # print("detected_instances: ", detected_instances, "\n")
+            # print("detection_map_all: \n", detection_map_all, "\n")
             # print(asda)
 
             ### COMPUTE AND FIND THE CENTERS OF THE INSTANCES FROM "LABEL" DATA
@@ -660,6 +711,7 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
                         loss_per_instance_no_fp = self.loss_function_instance(
                             output_batch * mask_out_instances * label_batch_cls, label_batch_cls)
                         loss_per_instance = loss_per_instance + loss_per_instance_no_fp
+                    # print(cc_lbl_counter, " -> loss_per_instance (DEBUGGING): ", loss_per_instance)
 
                     ## ADD SEGMENTATION TO THE LIST FOR ALL INSTANCES
                     if instance_wise_loss_flag:
@@ -669,11 +721,126 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
                         instance_wise_loss = torch.unsqueeze(loss_per_instance, 0)
                         instance_wise_loss_flag = True
 
+                    ## GET BOUNDING BOX INFORMATION FOR DETECTION
+                    mins_lbl, maxs_lbl = get_bbox_indices(
+                        idx_min, 
+                        idx_max, 
+                        output_batch.shape,
+                        spatial_dims=self.spatial_dims
+                    )
+
+                    # Get bounding box information for detection (differentiable) -- OLD
+                    mins_lbl = torch.as_tensor(mins_lbl, device=label_batch.device) # * torch.max(label_batch_cls)
+                    maxs_lbl = torch.as_tensor(maxs_lbl, device=label_batch.device) # * torch.max(label_batch_cls)
+                    center_lbl = (mins_lbl + torch.ceil((maxs_lbl - mins_lbl) / 2)) # * torch.max(label_batch_cls)
+
+                    # # Get bounding box information for detection (differentiable)
+                    # mins_lbl = torch.as_tensor(mins_lbl, device=label_batch.device) * (loss_per_instance + self.smoother)
+                    # maxs_lbl = torch.as_tensor(maxs_lbl, device=label_batch.device) * (loss_per_instance + self.smoother)
+                    # center_lbl = (mins_lbl + torch.ceil((maxs_lbl - mins_lbl) / 2)) * (loss_per_instance + self.smoother)
+                    
+                    ## ADD BOUNDING BOX INFORMATION FROM OUTPUT INSTANCES
+                    if bounding_boxes_label:
+                        center_coordinates_label = torch.cat((center_coordinates_label, torch.unsqueeze(center_lbl, 0)), 0)
+                        mins_boxes_coordinates_label = torch.cat((mins_boxes_coordinates_label, torch.unsqueeze(mins_lbl, 0)), 0)
+                        maxs_boxes_coordinates_label = torch.cat((maxs_boxes_coordinates_label, torch.unsqueeze(maxs_lbl, 0)), 0)
+                    else:
+                        center_coordinates_label = torch.unsqueeze(center_lbl, 0)
+                        mins_boxes_coordinates_label = torch.unsqueeze(mins_lbl, 0)
+                        maxs_boxes_coordinates_label = torch.unsqueeze(maxs_lbl, 0)
+                        bounding_boxes_label = True
+
                     del cc_lbl, mask_out_instances, label_batch_cls, lbl_idx
             else:
                 # In case there are no label instances
                 instance_wise_loss = loss_batch.reshape(1,)
                 instance_wise_loss_flag = True
+
+                ## Create mask with 1 in the middle of the batch (for backpropagation)
+                mask = torch.zeros(label_batch.shape, dtype=torch.bool, device=label_batch.device)
+                mask_center = torch.floor(torch.tensor(mask.shape) / 2).int()
+                if self.spatial_dims == 3:
+                    mask[0, 0, mask_center[2], mask_center[3], mask_center[4]] = True
+                elif self.spatial_dims == 2:
+                    mask[0, 0, mask_center[2], mask_center[3]] = True
+
+                ## COORDINATES FOR DETECTIONS -- (OLD V0)
+                position = torch.floor(torch.tensor(label_batch.squeeze().shape, device=label_batch.device) / 2)
+                mins_boxes_coordinates_label = torch.zeros((num_cc_label_temp, self.spatial_dims), dtype=label_batch.dtype, device=label_batch.device) + (position - 1)
+                center_coordinates_label = torch.zeros((num_cc_label_temp, self.spatial_dims), dtype=label_batch.dtype, device=label_batch.device) + position
+                maxs_boxes_coordinates_label = torch.zeros((num_cc_label_temp, self.spatial_dims), dtype=label_batch.dtype, device=label_batch.device) + (position + 1)
+
+                # ## COORDINATES FOR DETECTIONS -- (OLD)
+                # position = torch.floor(torch.tensor(label_batch.squeeze().shape, device=label_batch.device) / 2)
+                # mins_boxes_coordinates_label = torch.max(label_batch + mask) * torch.zeros(
+                #     (num_cc_label_temp, self.spatial_dims), dtype=label_batch.dtype, device=label_batch.device) + (position - 1)
+                # center_coordinates_label = torch.max(label_batch + mask) * torch.zeros(
+                #     (num_cc_label_temp, self.spatial_dims), dtype=label_batch.dtype, device=label_batch.device) + position
+                # maxs_boxes_coordinates_label = torch.max(label_batch + mask) * torch.zeros(
+                #     (num_cc_label_temp, self.spatial_dims), dtype=label_batch.dtype, device=label_batch.device) + (position + 1)
+
+                # ## COORDINATES FOR DETECTIONS
+                # position = torch.floor(torch.tensor(label_batch.squeeze().shape, device=label_batch.device) / 2)
+                # mins_boxes_coordinates_label = (loss_batch + self.smoother) * torch.zeros(
+                #     (num_cc_label_temp, self.spatial_dims), dtype=label_batch.dtype, device=label_batch.device) + (position - 1)
+                # center_coordinates_label = (loss_batch + self.smoother) * torch.zeros(
+                #     (num_cc_label_temp, self.spatial_dims), dtype=label_batch.dtype, device=label_batch.device) + position
+                # maxs_boxes_coordinates_label = (loss_batch + self.smoother) * torch.zeros(
+                #     (num_cc_label_temp, self.spatial_dims), dtype=label_batch.dtype, device=label_batch.device) + (position + 1)
+
+            ## FOR DEBUGGING
+            # print("")
+            # print("center_coordinates_output:\n", center_coordinates_output, "\n")
+            # print("center_coordinates_label :\n", center_coordinates_label, "\n")
+            # print(asda)
+
+            ## Calculate Distance-IoU in 3D
+            if self.spatial_dims == 3:
+                diou, _, _, _ = distance_box_iou_3D(
+                    center_coordinates_output, 
+                    mins_boxes_coordinates_output,
+                    maxs_boxes_coordinates_output,
+                    center_coordinates_label,
+                    mins_boxes_coordinates_label,
+                    maxs_boxes_coordinates_label,
+                )
+            elif self.spatial_dims == 2:
+                diou, _, _, _ = distance_box_iou_2D(
+                    center_coordinates_output, 
+                    mins_boxes_coordinates_output,
+                    maxs_boxes_coordinates_output,
+                    center_coordinates_label,
+                    mins_boxes_coordinates_label,
+                    maxs_boxes_coordinates_label,
+                )
+
+            diou_output_instance = torch.min(diou, dim=1)
+            diou_label_instance = torch.min(diou , dim=0)
+            # diou_output_instance_sum = torch.sum(diou_output_instance[0])
+            # diou_label_instance_sum = torch.sum(diou_label_instance[0])
+            diou_output_instance_sum = torch.sum(diou_output_instance[0] * instance_wise_out_loss)
+            diou_label_instance_sum = torch.sum(diou_label_instance[0] * instance_wise_loss)
+
+            ## Calculate detection loss using Distance-IoU loss
+            if not too_many:
+                detection_loss = (diou_label_instance_sum - diou_output_instance_sum) ** 2
+            else:
+                detection_loss = ((diou_label_instance_sum - diou_output_instance_sum) ** 2) + num_cc_output_temp
+
+            ## FOR DEBUGGING
+            # print("")
+            # print("diou: ", diou, "\n")
+            # print("diou_output_instance: ", diou_output_instance)
+            # print("instance_wise_out_loss  : ", instance_wise_out_loss)
+            # print("diou_output_instance[0] : ", diou_output_instance[0])
+            # print("diou_output_instance[0]*: ", diou_output_instance[0] * instance_wise_out_loss, "\n")
+            # print("diou_label_instance : ", diou_label_instance)
+            # print("instance_wise_loss     : ", instance_wise_loss)
+            # print("diou_label_instance[0] : ", diou_label_instance[0])
+            # print("diou_label_instance[0]*: ", diou_label_instance[0] * instance_wise_loss, "\n")
+            # print("diou_output_instance_sum: ", diou_output_instance_sum, "\n")
+            # print("diou_label_instance_sum : ", diou_label_instance_sum, "\n")
+            # print(asda)
 
             ## Calculate detection loss using Rate of Missed and False Instances (RMFI)
             loss_per_output_instance = torch.ceil((1 - loss_per_output_instance) * detection_map_all)
@@ -713,6 +880,12 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
             ppv = pred__tp / pred_sum
             fdr = 1 - ppv
 
+            ## FOR DEBUGGING
+            # print("")
+            # print("pred_sum: ", pred_sum)
+            # print("pred__tp: ", pred__tp)
+            # print("ppv     : ", ppv, "\n")
+
             if self.weighted_fdr:
                 fdr = fdr * (num_of_false_instances + 1)
 
@@ -742,6 +915,7 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
                     instance_wise_loss_batch = torch.unsqueeze(instance_wise_loss_reduce, 0)
                     instance_wise_out_loss_batch = torch.unsqueeze(instance_wise_out_loss_reduce, 0)
                 instance_center_loss_batch = torch.unsqueeze(cc_loss, 0)
+                instance_diou_batch = torch.unsqueeze(detection_loss, 0)
                 instance_false_loss_batch = torch.unsqueeze(fdr, 0)
                 instance_false_instances_loss_batch = torch.unsqueeze(num_of_false_instances, 0)
                 instance_missed_instances_loss_batch = torch.unsqueeze(instance_missed_loss, 0)
@@ -756,6 +930,7 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
                         (instance_wise_out_loss_batch, torch.unsqueeze(instance_wise_out_loss_reduce, 0)), 0)
                 instance_center_loss_batch = torch.cat(
                     (instance_center_loss_batch, torch.unsqueeze(cc_loss, 0)), 0)
+                instance_diou_batch = torch.cat((instance_diou_batch, torch.unsqueeze(detection_loss, 0)), 0)
                 instance_false_loss_batch = torch.cat(
                     (instance_false_loss_batch, torch.unsqueeze(fdr, 0)), 0)
                 instance_false_instances_loss_batch = torch.cat(
@@ -771,13 +946,14 @@ class InstanceCenterLoss(torch.nn.modules.loss._Loss):
         instance_wise_loss = torch.mean(instance_wise_loss_batch)
         instance_wise_out_loss = torch.mean(instance_wise_out_loss_batch)
         instance_center_loss = torch.mean(instance_center_loss_batch)
+        instance_diou_loss = torch.mean(instance_diou_batch)
         instance_false_loss = torch.mean(instance_false_loss_batch)
         instance_false_instances_loss = torch.mean(instance_false_instances_loss_batch)
         instance_missed_instances_loss = torch.mean(instance_missed_instances_loss_batch)
 
         del instance_wise_loss_batch, instance_center_loss_batch, instance_false_loss_batch, instance_wise_out_loss_batch
-        del instance_false_instances_loss_batch, instance_missed_instances_loss_batch
+        del instance_false_instances_loss_batch, instance_missed_instances_loss_batch, instance_diou_batch
 
         return segmentation_loss, instance_wise_loss, instance_wise_out_loss, instance_center_loss, \
-            instance_false_instances_loss, instance_missed_instances_loss
+            instance_false_instances_loss, instance_missed_instances_loss, instance_diou_loss
 
